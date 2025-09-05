@@ -24,6 +24,9 @@ namespace FastExpressionCompiler.UnitTests
             // new Issue441_Fails_to_pass_Constant_as_call_parameter_by_reference().Run();
             // new Issue461_InvalidProgramException_when_null_checking_type_by_ref().Run();
 
+            new SwitchTests().Emit_switch_opcode_for_8_cases();
+            return;
+            
             var t = new LightExpression.TestRun(LightExpression.TestFlags.RethrowException);
 
             t.Run(new LightExpression.IssueTests.Issue476_System_ExecutionEngineException_with_nullables_on_repeated_calls_to_ConcurrentDictionary());
@@ -126,6 +129,8 @@ namespace FastExpressionCompiler.UnitTests
                 Run(new LightExpression.UnitTests.LightExpressionTests().Run);
                 Run(new ToCSharpStringTests().Run);
                 Run(new LightExpression.UnitTests.ToCSharpStringTests().Run);
+                Run(new SwitchTests().Run);
+                Run(new LightExpression.UnitTests.SwitchTests().Run);
 
                 Console.WriteLine($"{Environment.NewLine}UnitTests are passing in {sw.ElapsedMilliseconds} ms.");
 

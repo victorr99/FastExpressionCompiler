@@ -5396,12 +5396,12 @@ namespace FastExpressionCompiler
                         param1ByRefIndex = 1;
                 }
 
-                // Emit the switch value once and store it in the local variable for comparison in cases below
-                if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
-                    return false;
-
                 if (caseCount == 0) // see #440
                 {
+                    // Emit the switch value once and store it in the local variable for comparison in cases below
+                    if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
+                        return false;
+                    
                     il.Demit(OpCodes.Pop); // remove the switch value result
                     return expr.DefaultBody == null ||
                         TryEmit(expr.DefaultBody, paramExprs, il, ref closure, setup, parent);
@@ -5410,100 +5410,273 @@ namespace FastExpressionCompiler
                 var switchValueVar = EmitStoreLocalVariable(il, switchValueType);
 
                 var switchEndLabel = il.DefineLabel();
-                var caseLabels = new Label[caseCount];
 
-                for (var caseIndex = 0; caseIndex < caseLabels.Length; ++caseIndex)
+                var emitSwitch = caseCount >= 7; // TODO: benchmark
+                var isInt64 = false;
+                var lowestCaseValue = long.MaxValue;
+                var highestCaseValue = long.MinValue;
+
+                if (emitSwitch)
                 {
-                    var cs = cases[caseIndex];
-                    var caseBodyLabel = il.DefineLabel();
-                    caseLabels[caseIndex] = caseBodyLabel;
-
-                    foreach (var caseTestValue in cs.TestValues)
+                    for (var caseIndex = 0; caseIndex < caseCount; ++caseIndex)
                     {
-                        if (!switchValueIsNullable)
+                        var cs = cases[caseIndex];
+                        
+                        foreach (var caseTestValue in cs.TestValues)
                         {
-                            EmitLoadLocalVariable(il, switchValueVar);
-                            if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex))
-                                return false;
-                            if (equalityMethod == null)
+                            if (caseTestValue is not ConstantExpression constant)
                             {
-                                il.Demit(OpCodes.Beq, caseBodyLabel);
-                                continue;
+                                emitSwitch = false;
+                                break;
                             }
 
-                            if (!EmitMethodCall(il, equalityMethod))
-                                return false;
-                            il.Demit(OpCodes.Brtrue, caseBodyLabel);
-                            continue;
-                        }
-
-                        if (equalityMethod != null & !isEqualityMethodForUnderlyingNullable)
-                        {
-                            EmitLoadLocalVariable(il, switchValueVar);
-                            if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex) ||
-                                !EmitMethodCall(il, equalityMethod))
-                                return false;
-                            il.Demit(OpCodes.Brtrue, caseBodyLabel);
-                            continue;
-                        }
-
-                        if (equalityMethod == null)
-                        {
-                            // short-circuit the comparison with the null, if the switch value has value == false the let's do a Brfalse
-                            if (caseTestValue is ConstantExpression r && r.Value == null)
+                            // FIXME: what about enums?
+                            if (constant.Value is not byte
+                                and not sbyte
+                                and not short
+                                and not ushort
+                                and not int
+                                and not uint
+                                and not long
+                                and not ulong )
                             {
-                                EmitLoadLocalVariableAddress(il, switchValueVar);
-                                EmitMethodCall(il, switchNullableHasValueMethod);
-                                il.Demit(OpCodes.Brfalse, caseBodyLabel);
-                                continue;
+                                emitSwitch = false;
+                                break;
                             }
+                            
+                            lowestCaseValue = Math.Min(System.Convert.ToInt64(constant.Value), lowestCaseValue);
+                            highestCaseValue = Math.Max(System.Convert.ToInt64(constant.Value), highestCaseValue);
                         }
+                    }
+                    
+                    // FIXME: emitSwitch is not possible when overflowing is required (shifting the values to 0-based
+                    // offset may overflow the higher values.
 
-                        // Compare the switch value with the case value via Ceq or comparison method and then compare the HasValue of both
-                        EmitLoadLocalVariableAddress(il, switchValueVar);
-                        il.Demit(OpCodes.Ldfld, switchNullableUnsafeValueField);
-                        if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex))
-                            return false;
-                        var caseValueVar = EmitStoreAndLoadLocalVariableAddress(il, switchValueType);
-                        il.Demit(OpCodes.Ldfld, switchNullableUnsafeValueField);
-                        if (equalityMethod == null)
-                            il.Demit(OpCodes.Ceq);
-                        else if (!EmitMethodCall(il, equalityMethod))
-                            return false;
-
-                        EmitLoadLocalVariableAddress(il, switchValueVar);
-                        EmitMethodCall(il, switchNullableHasValueMethod);
-                        EmitLoadLocalVariableAddress(il, caseValueVar);
-                        EmitMethodCall(il, switchNullableHasValueMethod);
-                        il.Demit(OpCodes.Ceq);
-
-                        il.Demit(OpCodes.And); // both the Nullable values and HashValue results need to be true
-                        il.Demit(OpCodes.Brtrue, caseBodyLabel);
+                    if (emitSwitch)
+                    {
+                        var density = (highestCaseValue - lowestCaseValue) / (double)caseCount;
+                        emitSwitch = density > 0.5; // TODO: benchmark
                     }
                 }
-
-                var defaultBody = expr.DefaultBody;
-                if (defaultBody == null)
+                
+                if (emitSwitch) 
                 {
-                    // hop over the cases bodies right to the end of switch
-                    il.Demit(OpCodes.Br, switchEndLabel);
+                    // The switch opcode pops a value from the stack and translates the value to an offset. Thus if the
+                    // value 3 is popped, a jump will take place to the label at offset 3.
+                    // The offset is always 0-based, meaning that we have to decrement the value taken by switch with
+                    // the value of the first case, which is the lowest.
+                    // If our cases are not sequentially incremented, for example: 0, 1, 3, 4. We still need to add a
+                    // label for offset 2. This label will refer to the first instruction after the switch case
+                    // including all bodies.
+                    // The body for the default case is implemented directly after the switch instruction, before the
+                    // bodies of the matchable cases. The switch will 'fall through' when the provided value did not
+                    // match any of the offsets in the jump table.
+                    // A fall through or goto case is supported by emitting the labels and jumping to the proper
+                    // position. We try to place the case bodies in such order that fall through's can be executed
+                    // without jumping.
+
+                    var caseLabels = new SortedList<long, Label>(caseCount);
+                    var labels = new Label[caseCount];
+                    
+                    for (var caseIndex = 0; caseIndex < caseCount; ++caseIndex)
+                    {
+                        var cs = cases[caseIndex];
+                        var caseBodyLabel = il.DefineLabel();
+                        labels[caseIndex] = caseBodyLabel;
+
+                        foreach (var caseTestValue in cs.TestValues)
+                        {
+                            // The caseTestValue is an ConstantExpression here. The Value is compatible with u32
+                            var constant = (ConstantExpression)caseTestValue;
+                            var value = System.Convert.ToInt64(constant.Value);
+
+                            caseLabels[value] = caseBodyLabel;
+                        }
+                    }
+
+                    var jumpTableSize = highestCaseValue - lowestCaseValue;
+                    var jumpTable = new Label[jumpTableSize];
+                    Label? fallThroughLabel = null;
+
+                    for (var caseValue = lowestCaseValue; caseValue < highestCaseValue; caseValue++)
+                    {
+                        var offset = caseValue - lowestCaseValue;
+
+                        if (caseLabels.TryGetValue(caseValue, out var label))
+                        {
+                            jumpTable[offset] = label;
+                        }
+                        else
+                        {
+                            fallThroughLabel ??= expr.DefaultBody is null 
+                                ? switchEndLabel 
+                                : il.DefineLabel();
+                            
+                            jumpTable[offset] = fallThroughLabel.Value;
+                        }
+                    }
+
+                    // The value provided to the switch-opcode must be 0-based.
+                    if (lowestCaseValue > 0)
+                    {
+                        if (isInt64)
+                        {
+                            il.Demit(OpCodes.Ldc_I8, lowestCaseValue);
+                        }
+                        else
+                        {
+                            il.Demit(OpCodes.Ldc_I4, lowestCaseValue);
+                        }
+                        
+                        il.Demit(OpCodes.Sub);
+                    }
+                    else if (lowestCaseValue < 0)
+                    {
+                        if (isInt64)
+                        {
+                            il.Demit(OpCodes.Ldc_I8, lowestCaseValue);
+                        }
+                        else
+                        {
+                            il.Demit(OpCodes.Ldc_I4, lowestCaseValue);
+                        }
+                        
+                        il.Demit(OpCodes.Add);
+                    }
+                    
+                    il.Demit(OpCodes.Switch, jumpTable);
+                    
+                    var defaultBody = expr.DefaultBody;
+                    if (defaultBody == null)
+                    {
+                        // hop over the cases bodies right to the end of switch
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
+                    else
+                    {
+                        if (fallThroughLabel.HasValue)
+                        {
+                            il.DmarkLabel(fallThroughLabel.Value);
+                        }
+                        
+                        if (!TryEmit(defaultBody, paramExprs, il, ref closure, setup, parent))
+                            return false;
+                        // as we are at the end, no need to jump to it
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
+
+                    for (var caseIndex = 0; caseIndex < caseCount; ++caseIndex)
+                    {
+                        il.DmarkLabel(labels[caseIndex]);
+                        var cs = cases[caseIndex];
+                        if (!TryEmit(cs.Body, paramExprs, il, ref closure, setup, parent))
+                            return false;
+
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
                 }
                 else
-                {
-                    if (!TryEmit(defaultBody, paramExprs, il, ref closure, setup, parent))
+                { 
+                    // Emit the switch value once and store it in the local variable for comparison in cases below
+                    if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
                         return false;
-                    // as we are at the end, no need to jump to it
-                    il.Demit(OpCodes.Br, switchEndLabel);
-                }
+                    
+                    var caseLabels = new Label[caseCount];
+                    
+                    for (var caseIndex = 0; caseIndex < caseLabels.Length; ++caseIndex)
+                    {
+                        var cs = cases[caseIndex];
+                        var caseBodyLabel = il.DefineLabel();
+                        caseLabels[caseIndex] = caseBodyLabel;
 
-                for (var caseIndex = 0; caseIndex < caseLabels.Length; ++caseIndex)
-                {
-                    il.DmarkLabel(caseLabels[caseIndex]);
-                    var cs = cases[caseIndex];
-                    if (!TryEmit(cs.Body, paramExprs, il, ref closure, setup, parent))
-                        return false;
+                        foreach (var caseTestValue in cs.TestValues)
+                        {
+                            if (!switchValueIsNullable)
+                            {
+                                EmitLoadLocalVariable(il, switchValueVar);
+                                if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex))
+                                    return false;
+                                if (equalityMethod == null)
+                                {
+                                    il.Demit(OpCodes.Beq, caseBodyLabel);
+                                    continue;
+                                }
 
-                    il.Demit(OpCodes.Br, switchEndLabel);
+                                if (!EmitMethodCall(il, equalityMethod))
+                                    return false;
+                                il.Demit(OpCodes.Brtrue, caseBodyLabel);
+                                continue;
+                            }
+
+                            if (equalityMethod != null & !isEqualityMethodForUnderlyingNullable)
+                            {
+                                EmitLoadLocalVariable(il, switchValueVar);
+                                if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex) ||
+                                    !EmitMethodCall(il, equalityMethod))
+                                    return false;
+                                il.Demit(OpCodes.Brtrue, caseBodyLabel);
+                                continue;
+                            }
+
+                            if (equalityMethod == null)
+                            {
+                                // short-circuit the comparison with the null, if the switch value has value == false the let's do a Brfalse
+                                if (caseTestValue is ConstantExpression r && r.Value == null)
+                                {
+                                    EmitLoadLocalVariableAddress(il, switchValueVar);
+                                    EmitMethodCall(il, switchNullableHasValueMethod);
+                                    il.Demit(OpCodes.Brfalse, caseBodyLabel);
+                                    continue;
+                                }
+                            }
+
+                            // Compare the switch value with the case value via Ceq or comparison method and then compare the HasValue of both
+                            EmitLoadLocalVariableAddress(il, switchValueVar);
+                            il.Demit(OpCodes.Ldfld, switchNullableUnsafeValueField);
+                            if (!TryEmit(caseTestValue, paramExprs, il, ref closure, setup, operandParent, param1ByRefIndex))
+                                return false;
+                            var caseValueVar = EmitStoreAndLoadLocalVariableAddress(il, switchValueType);
+                            il.Demit(OpCodes.Ldfld, switchNullableUnsafeValueField);
+                            if (equalityMethod == null)
+                                il.Demit(OpCodes.Ceq);
+                            else if (!EmitMethodCall(il, equalityMethod))
+                                return false;
+
+                            EmitLoadLocalVariableAddress(il, switchValueVar);
+                            EmitMethodCall(il, switchNullableHasValueMethod);
+                            EmitLoadLocalVariableAddress(il, caseValueVar);
+                            EmitMethodCall(il, switchNullableHasValueMethod);
+                            il.Demit(OpCodes.Ceq);
+
+                            il.Demit(OpCodes.And); // both the Nullable values and HashValue results need to be true
+                            il.Demit(OpCodes.Brtrue, caseBodyLabel);
+                        }
+                    }
+                    
+                    // FIXME (victorr99): same code, different params...
+                    var defaultBody = expr.DefaultBody;
+                    if (defaultBody == null)
+                    {
+                        // hop over the cases bodies right to the end of switch
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
+                    else
+                    {
+                        if (!TryEmit(defaultBody, paramExprs, il, ref closure, setup, parent))
+                            return false;
+                        // as we are at the end, no need to jump to it
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
+
+                    for (var caseIndex = 0; caseIndex < caseLabels.Length; ++caseIndex)
+                    {
+                        il.DmarkLabel(caseLabels[caseIndex]);
+                        var cs = cases[caseIndex];
+                        if (!TryEmit(cs.Body, paramExprs, il, ref closure, setup, parent))
+                            return false;
+
+                        il.Demit(OpCodes.Br, switchEndLabel);
+                    }
                 }
 
                 il.DmarkLabel(switchEndLabel);
@@ -8283,6 +8456,15 @@ namespace FastExpressionCompiler
         }
 
         [MethodImpl((MethodImplOptions)256)]
+        public static void Demit(this ILGenerator il, OpCode opcode, Label[] values,
+            [CallerArgumentExpression("values")] string valueName = null, [CallerMemberName] string emitterName = null, [CallerLineNumber] int emitterLine = 0)
+        {
+            il.Emit(opcode, values);
+            if (DisableDemit) return;
+            Debug.WriteLine($"{opcode} {valueName ?? string.Join(", ", values)}  -- {emitterName}:{emitterLine}");
+        }
+
+        [MethodImpl((MethodImplOptions)256)]
         public static void DmarkLabel(this ILGenerator il, Label value,
             [CallerArgumentExpression("value")] string valueName = null, [CallerMemberName] string emitterName = null, [CallerLineNumber] int emitterLine = 0)
         {
@@ -8372,6 +8554,9 @@ namespace FastExpressionCompiler
         [MethodImpl((MethodImplOptions)256)]
         public static void Demit(this ILGenerator il, OpCode opcode, ConstructorInfo value) => il.Emit(opcode, value);
 
+        [MethodImpl((MethodImplOptions)256)]
+        public static void Demit(this ILGenerator il, OpCode opcode, Label[] values) => il.Emit(opcode, values);
+        
         [MethodImpl((MethodImplOptions)256)]
         public static void Demit(this ILGenerator il, OpCode opcode, Label value) => il.Emit(opcode, value);
 
