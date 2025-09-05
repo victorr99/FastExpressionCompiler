@@ -5396,18 +5396,16 @@ namespace FastExpressionCompiler
                         param1ByRefIndex = 1;
                 }
 
+                // Emit the switch value once and store it in the local variable for comparison in cases below
+                if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
+                    return false;
+                
                 if (caseCount == 0) // see #440
                 {
-                    // Emit the switch value once and store it in the local variable for comparison in cases below
-                    if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
-                        return false;
-                    
                     il.Demit(OpCodes.Pop); // remove the switch value result
                     return expr.DefaultBody == null ||
                         TryEmit(expr.DefaultBody, paramExprs, il, ref closure, setup, parent);
                 }
-
-                var switchValueVar = EmitStoreLocalVariable(il, switchValueType);
 
                 var switchEndLabel = il.DefineLabel();
 
@@ -5577,9 +5575,7 @@ namespace FastExpressionCompiler
                 }
                 else
                 { 
-                    // Emit the switch value once and store it in the local variable for comparison in cases below
-                    if (!TryEmit(switchValueExpr, paramExprs, il, ref closure, setup, operandParent, param0ByRefIndex))
-                        return false;
+                    var switchValueVar = EmitStoreLocalVariable(il, switchValueType);
                     
                     var caseLabels = new Label[caseCount];
                     
